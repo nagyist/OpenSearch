@@ -12,9 +12,11 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterStateTaskExecutor;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 
 import java.util.HashSet;
 import java.util.List;
@@ -22,22 +24,42 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 /**
  * This class does throttling on task submission to cluster manager node, it uses throttling key defined in various executors
  * as key for throttling. Throttling will be performed over task executor's class level, different task types have different executors class.
- *
+ * <p>
  * Set specific setting to for setting the threshold of throttling of particular task type.
  * e.g : Set "cluster_manager.throttling.thresholds.put_mapping" to set throttling limit of "put mapping" tasks,
- *       Set it to default value(-1) to disable the throttling for this task type.
+ * Set it to default value(-1) to disable the throttling for this task type.
  */
 public class ClusterManagerTaskThrottler implements TaskBatcherListener {
     private static final Logger logger = LogManager.getLogger(ClusterManagerTaskThrottler.class);
     public static final ThrottlingKey DEFAULT_THROTTLING_KEY = new ThrottlingKey("default-task-key", false);
 
+    // default value for base delay is 5s
+    static volatile TimeValue baseDelay = TimeValue.timeValueSeconds(5);
+    // default values for max delay is 30s
+    static volatile TimeValue maxDelay = TimeValue.timeValueSeconds(30);
+
     public static final Setting<Settings> THRESHOLD_SETTINGS = Setting.groupSetting(
         "cluster_manager.throttling.thresholds.",
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
+    public static final Setting<TimeValue> BASE_DELAY_SETTINGS = Setting.timeSetting(
+        "cluster_manager.throttling.retry.base.delay",
+        baseDelay,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
+    public static final Setting<TimeValue> MAX_DELAY_SETTINGS = Setting.timeSetting(
+        "cluster_manager.throttling.retry.max.delay",
+        maxDelay,
         Setting.Property.Dynamic,
         Setting.Property.NodeScope
     );
@@ -47,9 +69,14 @@ public class ClusterManagerTaskThrottler implements TaskBatcherListener {
     private final int MIN_THRESHOLD_VALUE = -1; // Disabled throttling
     private final ClusterManagerTaskThrottlerListener clusterManagerTaskThrottlerListener;
 
-    private final ConcurrentMap<String, Long> tasksCount;
+    final ConcurrentMap<String, Long> tasksCount;
     private final ConcurrentMap<String, Long> tasksThreshold;
     private final Supplier<Version> minNodeVersionSupplier;
+
+    // Once all nodes are greater than or equal 2.5.0 version, then only it will start throttling.
+    // During upgrade as well, it will wait for all older version nodes to leave the cluster before starting throttling.
+    // This is needed specifically for static setting to enable throttling.
+    private AtomicBoolean startThrottling = new AtomicBoolean();
 
     public ClusterManagerTaskThrottler(
         final Settings settings,
@@ -62,8 +89,28 @@ public class ClusterManagerTaskThrottler implements TaskBatcherListener {
         this.minNodeVersionSupplier = minNodeVersionSupplier;
         this.clusterManagerTaskThrottlerListener = clusterManagerTaskThrottlerListener;
         clusterSettings.addSettingsUpdateConsumer(THRESHOLD_SETTINGS, this::updateSetting, this::validateSetting);
+        clusterSettings.addSettingsUpdateConsumer(BASE_DELAY_SETTINGS, this::updateBaseDelay);
+        clusterSettings.addSettingsUpdateConsumer(MAX_DELAY_SETTINGS, this::updateMaxDelay);
         // Required for setting values as per current settings during node bootstrap
         updateSetting(THRESHOLD_SETTINGS.get(settings));
+        updateBaseDelay(BASE_DELAY_SETTINGS.get(settings));
+        updateMaxDelay(MAX_DELAY_SETTINGS.get(settings));
+    }
+
+    void updateBaseDelay(TimeValue newBaseValue) {
+        baseDelay = newBaseValue;
+    }
+
+    void updateMaxDelay(TimeValue newMaxValue) {
+        maxDelay = newMaxValue;
+    }
+
+    public static TimeValue getBaseDelayForRetry() {
+        return baseDelay;
+    }
+
+    public static TimeValue getMaxDelayForRetry() {
+        return maxDelay;
     }
 
     /**
@@ -71,9 +118,9 @@ public class ClusterManagerTaskThrottler implements TaskBatcherListener {
      * * Register task to cluster service with task key,
      * * override getClusterManagerThrottlingKey method with above task key in task executor.
      * * Verify that throttled tasks would be retried from data nodes
-     *
+     * <p>
      * Added retry mechanism in TransportClusterManagerNodeAction, so it would be retried for customer generated tasks.
-     *
+     * <p>
      * If tasks are not getting retried then we can register with false flag, so user won't be able to configure threshold limits for it.
      */
     protected ThrottlingKey registerClusterManagerTask(String taskKey, boolean throttlingEnabled) {
@@ -87,7 +134,10 @@ public class ClusterManagerTaskThrottler implements TaskBatcherListener {
 
     /**
      * Class to store the throttling key for the tasks of cluster manager
+     *
+     * @opensearch.api
      */
+    @PublicApi(since = "1.0.0")
     public static class ThrottlingKey {
         private String taskThrottlingKey;
         private boolean throttlingEnabled;
@@ -115,8 +165,8 @@ public class ClusterManagerTaskThrottler implements TaskBatcherListener {
     void validateSetting(final Settings settings) {
         Map<String, Settings> groups = settings.getAsGroups();
         if (groups.size() > 0) {
-            if (minNodeVersionSupplier.get().compareTo(Version.V_2_4_0) < 0) {
-                throw new IllegalArgumentException("All the nodes in cluster should be on version later than or equal to 2.4.0");
+            if (minNodeVersionSupplier.get().compareTo(Version.V_2_5_0) < 0) {
+                throw new IllegalArgumentException("All the nodes in cluster should be on version later than or equal to 2.5.0");
             }
         }
         for (String key : groups.keySet()) {
@@ -159,30 +209,81 @@ public class ClusterManagerTaskThrottler implements TaskBatcherListener {
         return tasksThreshold.get(taskKey);
     }
 
+    private void failFastWhenThrottlingThresholdsAreAlreadyBreached(
+        final boolean throttlingEnabledWithThreshold,
+        final Long threshold,
+        final long existingTaskCount,
+        final int incomingTaskCount,
+        final String taskThrottlingKey
+    ) {
+        if (throttlingEnabledWithThreshold && shouldThrottle(threshold, existingTaskCount, incomingTaskCount)) {
+            throw new ClusterManagerThrottlingException("Throttling Exception : Limit exceeded for " + taskThrottlingKey);
+        }
+    }
+
     @Override
     public void onBeginSubmit(List<? extends TaskBatcher.BatchedTask> tasks) {
-        ThrottlingKey clusterManagerThrottlingKey = ((ClusterStateTaskExecutor<Object>) tasks.get(0).batchingKey)
+        final ThrottlingKey clusterManagerThrottlingKey = ((ClusterStateTaskExecutor<Object>) tasks.get(0).batchingKey)
             .getClusterManagerThrottlingKey();
-        tasksCount.putIfAbsent(clusterManagerThrottlingKey.getTaskThrottlingKey(), 0L);
-        tasksCount.computeIfPresent(clusterManagerThrottlingKey.getTaskThrottlingKey(), (key, count) -> {
-            int size = tasks.size();
-            if (clusterManagerThrottlingKey.isThrottlingEnabled()) {
-                Long threshold = tasksThreshold.get(clusterManagerThrottlingKey.getTaskThrottlingKey());
-                if (threshold != null && (count + size > threshold)) {
-                    clusterManagerTaskThrottlerListener.onThrottle(clusterManagerThrottlingKey.getTaskThrottlingKey(), size);
-                    logger.warn(
-                        "Throwing Throttling Exception for [{}]. Trying to add [{}] tasks to queue, limit is set to [{}]",
-                        clusterManagerThrottlingKey.getTaskThrottlingKey(),
-                        tasks.size(),
-                        threshold
-                    );
-                    throw new ClusterManagerThrottlingException(
-                        "Throttling Exception : Limit exceeded for " + clusterManagerThrottlingKey.getTaskThrottlingKey()
-                    );
-                }
+        final String taskThrottlingKey = clusterManagerThrottlingKey.getTaskThrottlingKey();
+        final Long threshold = getThrottlingLimit(taskThrottlingKey);
+        final boolean isThrottlingEnabledWithThreshold = clusterManagerThrottlingKey.isThrottlingEnabled() && threshold != null;
+        int incomingTaskCount = tasks.size();
+
+        try {
+            tasksCount.putIfAbsent(taskThrottlingKey, 0L);
+            // Perform shallow check before acquiring lock to avoid blocking of network threads
+            // if throttling is ongoing for a specific task
+            failFastWhenThrottlingThresholdsAreAlreadyBreached(
+                isThrottlingEnabledWithThreshold,
+                threshold,
+                tasksCount.get(taskThrottlingKey),
+                incomingTaskCount,
+                taskThrottlingKey
+            );
+
+            tasksCount.computeIfPresent(taskThrottlingKey, (key, existingTaskCount) -> {
+                failFastWhenThrottlingThresholdsAreAlreadyBreached(
+                    isThrottlingEnabledWithThreshold,
+                    threshold,
+                    existingTaskCount,
+                    incomingTaskCount,
+                    taskThrottlingKey
+                );
+                return existingTaskCount + incomingTaskCount;
+            });
+        } catch (final ClusterManagerThrottlingException e) {
+            clusterManagerTaskThrottlerListener.onThrottle(taskThrottlingKey, incomingTaskCount);
+            logger.trace(
+                "Throwing Throttling Exception for [{}]. Trying to add [{}] tasks to queue, limit is set to [{}]",
+                taskThrottlingKey,
+                incomingTaskCount,
+                threshold
+            );
+            throw e;
+        }
+    }
+
+    /**
+     * If throttling thresholds are set via static setting, it will update the threshold map.
+     * It may start throwing throttling exception to older nodes in cluster.
+     * Older version nodes will not be equipped to handle the throttling exception and
+     * this may result in unexpected behavior where internal tasks would start failing without any retries.
+     * <p>
+     * For every task submission request, it will validate if nodes version is greater or equal to 2.5.0 and set the startThrottling flag.
+     * Once the startThrottling flag is set, it will not perform check for next set of tasks.
+     */
+    private boolean shouldThrottle(Long threshold, Long count, int size) {
+        if (!startThrottling.get()) {
+            if (minNodeVersionSupplier.get().compareTo(Version.V_2_5_0) >= 0) {
+                startThrottling.compareAndSet(false, true);
+                logger.info("Starting cluster manager throttling as all nodes are higher than or equal to 2.5.0");
+            } else {
+                logger.info("Skipping cluster manager throttling as at least one node < 2.5.0 is present in cluster");
+                return false;
             }
-            return count + size;
-        });
+        }
+        return count + size > threshold;
     }
 
     @Override
