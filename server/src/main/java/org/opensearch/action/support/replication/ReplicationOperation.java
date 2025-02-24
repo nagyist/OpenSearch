@@ -34,10 +34,8 @@ package org.opensearch.action.support.replication;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.lucene.store.AlreadyClosedException;
-import org.opensearch.Assertions;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchException;
-import org.opensearch.action.ActionListener;
 import org.opensearch.action.UnavailableShardsException;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.action.support.RetryableAction;
@@ -47,15 +45,17 @@ import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.Nullable;
-import org.opensearch.common.breaker.CircuitBreakingException;
-import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.concurrent.OpenSearchRejectedExecutionException;
+import org.opensearch.core.Assertions;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.breaker.CircuitBreakingException;
+import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.ReplicationGroup;
-import org.opensearch.index.shard.ShardId;
 import org.opensearch.node.NodeClosedException;
-import org.opensearch.rest.RestStatus;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.ConnectTransportException;
 
@@ -66,6 +66,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 /**
@@ -140,15 +141,7 @@ public class ReplicationOperation<
         final ShardRouting primaryRouting = primary.routingEntry();
         final ShardId primaryId = primaryRouting.shardId();
         if (activeShardCountFailure != null) {
-            finishAsFailed(
-                new UnavailableShardsException(
-                    primaryId,
-                    "{} Timeout: [{}], request: [{}]",
-                    activeShardCountFailure,
-                    request.timeout(),
-                    request
-                )
-            );
+            finishAsFailed(new UnavailableShardsException(primaryId, "{} Timeout: [{}]", activeShardCountFailure, request.timeout()));
             return;
         }
 
@@ -237,17 +230,19 @@ public class ReplicationOperation<
                 globalCheckpoint,
                 maxSeqNoOfUpdatesOrDeletes,
                 pendingReplicationActions,
-                replicaRequest
+                replicaRequest,
+                primaryTerm
             ).build();
             replicationProxy.performOnReplicaProxy(proxyRequest, this::performOnReplica);
         }
     }
 
-    private void performOnReplica(final ReplicationProxyRequest<ReplicaRequest> replicationProxyRequest) {
+    private void performOnReplica(
+        final Consumer<ActionListener<ReplicaResponse>> replicasProxyConsumer,
+        final ReplicationProxyRequest<ReplicaRequest> replicationProxyRequest
+    ) {
         final ShardRouting shard = replicationProxyRequest.getShardRouting();
         final ReplicaRequest replicaRequest = replicationProxyRequest.getReplicaRequest();
-        final long globalCheckpoint = replicationProxyRequest.getGlobalCheckpoint();
-        final long maxSeqNoOfUpdatesOrDeletes = replicationProxyRequest.getMaxSeqNoOfUpdatesOrDeletes();
         final PendingReplicationActions pendingReplicationActions = replicationProxyRequest.getPendingReplicationActions();
 
         if (logger.isTraceEnabled()) {
@@ -319,7 +314,7 @@ public class ReplicationOperation<
 
             @Override
             public void tryAction(ActionListener<ReplicaResponse> listener) {
-                replicasProxy.performOn(shard, replicaRequest, primaryTerm, globalCheckpoint, maxSeqNoOfUpdatesOrDeletes, listener);
+                replicasProxyConsumer.accept(listener);
             }
 
             @Override
@@ -476,7 +471,7 @@ public class ReplicationOperation<
 
         /**
          * Notifies the primary of a local checkpoint for the given allocation.
-         *
+         * <p>
          * Note: The primary will use this information to advance the global checkpoint if possible.
          *
          * @param allocationId allocation ID of the shard corresponding to the supplied local checkpoint

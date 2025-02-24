@@ -11,8 +11,10 @@ package org.opensearch.index.translog.transfer;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.index.translog.TranslogReader;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
@@ -21,16 +23,16 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 
+import static org.opensearch.index.translog.transfer.FileSnapshot.CheckpointFileSnapshot;
 import static org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot;
 import static org.opensearch.index.translog.transfer.FileSnapshot.TranslogFileSnapshot;
-import static org.opensearch.index.translog.transfer.FileSnapshot.CheckpointFileSnapshot;
 
 /**
  * Implementation for a {@link TransferSnapshot} which builds the snapshot from the translog and checkpoint files present on the local-disk
  *
  * @opensearch.internal
  */
-public class TranslogCheckpointTransferSnapshot implements TransferSnapshot {
+public class TranslogCheckpointTransferSnapshot implements TransferSnapshot, Closeable {
 
     private final Set<Tuple<TranslogFileSnapshot, CheckpointFileSnapshot>> translogCheckpointFileInfoTupleSet;
     private final int size;
@@ -38,11 +40,14 @@ public class TranslogCheckpointTransferSnapshot implements TransferSnapshot {
     private final long primaryTerm;
     private long minTranslogGeneration;
 
-    TranslogCheckpointTransferSnapshot(long primaryTerm, long generation, int size) {
+    private String nodeId;
+
+    TranslogCheckpointTransferSnapshot(long primaryTerm, long generation, int size, String nodeId) {
         translogCheckpointFileInfoTupleSet = new HashSet<>(size);
         this.size = size;
         this.generation = generation;
         this.primaryTerm = primaryTerm;
+        this.nodeId = nodeId;
     }
 
     private void add(TranslogFileSnapshot translogFileSnapshot, CheckpointFileSnapshot checkPointFileSnapshot) {
@@ -60,13 +65,49 @@ public class TranslogCheckpointTransferSnapshot implements TransferSnapshot {
     }
 
     @Override
+    public Set<TransferFileSnapshot> getTranslogFileSnapshotWithMetadata() throws IOException {
+        for (Tuple<TranslogFileSnapshot, CheckpointFileSnapshot> tuple : translogCheckpointFileInfoTupleSet) {
+            TransferFileSnapshot translogFileSnapshot = tuple.v1();
+            TransferFileSnapshot checkpointFileSnapshot = tuple.v2();
+            translogFileSnapshot.setMetadataFileInputStream(checkpointFileSnapshot.inputStream());
+        }
+        return getTranslogFileSnapshots();
+    }
+
+    @Override
     public TranslogTransferMetadata getTranslogTransferMetadata() {
-        return new TranslogTransferMetadata(primaryTerm, generation, minTranslogGeneration, translogCheckpointFileInfoTupleSet.size() * 2);
+        return new TranslogTransferMetadata(
+            primaryTerm,
+            generation,
+            minTranslogGeneration,
+            translogCheckpointFileInfoTupleSet.size() * 2,
+            nodeId
+        );
     }
 
     @Override
     public Set<TransferFileSnapshot> getCheckpointFileSnapshots() {
         return translogCheckpointFileInfoTupleSet.stream().map(Tuple::v2).collect(Collectors.toSet());
+    }
+
+    public void close() throws IOException {
+        List<Exception> exceptionList = new ArrayList<>();
+        Set<FileSnapshot.TransferFileSnapshot> fileSnapshots = getTranslogFileSnapshots();
+        fileSnapshots.addAll(getCheckpointFileSnapshots());
+
+        for (FileSnapshot fileSnapshot : fileSnapshots) {
+            try {
+                fileSnapshot.close();
+            } catch (IOException e) {
+                exceptionList.add(e);
+            }
+        }
+
+        if (!exceptionList.isEmpty()) {
+            IOException ex = new IOException("IO Exception while closing file snapshots");
+            exceptionList.forEach(ex::addSuppressed);
+            throw ex;
+        }
     }
 
     @Override
@@ -88,19 +129,22 @@ public class TranslogCheckpointTransferSnapshot implements TransferSnapshot {
         private final List<TranslogReader> readers;
         private final Function<Long, String> checkpointGenFileNameMapper;
         private final Path location;
+        private final String nodeId;
 
         public Builder(
             long primaryTerm,
             long generation,
             Path location,
             List<TranslogReader> readers,
-            Function<Long, String> checkpointGenFileNameMapper
+            Function<Long, String> checkpointGenFileNameMapper,
+            String nodeId
         ) {
             this.primaryTerm = primaryTerm;
             this.generation = generation;
             this.readers = readers;
             this.checkpointGenFileNameMapper = checkpointGenFileNameMapper;
             this.location = location;
+            this.nodeId = nodeId;
         }
 
         public TranslogCheckpointTransferSnapshot build() throws IOException {
@@ -112,7 +156,8 @@ public class TranslogCheckpointTransferSnapshot implements TransferSnapshot {
             TranslogCheckpointTransferSnapshot translogTransferSnapshot = new TranslogCheckpointTransferSnapshot(
                 primaryTerm,
                 generation,
-                readers.size()
+                readers.size(),
+                nodeId
             );
             for (TranslogReader reader : readers) {
                 final long readerGeneration = reader.getGeneration();
@@ -123,8 +168,14 @@ public class TranslogCheckpointTransferSnapshot implements TransferSnapshot {
                 Path checkpointPath = location.resolve(checkpointGenFileNameMapper.apply(readerGeneration));
                 generations.add(readerGeneration);
                 translogTransferSnapshot.add(
-                    new TranslogFileSnapshot(readerPrimaryTerm, readerGeneration, translogPath),
-                    new CheckpointFileSnapshot(readerPrimaryTerm, checkpointGeneration, minTranslogGeneration, checkpointPath)
+                    new TranslogFileSnapshot(readerPrimaryTerm, readerGeneration, translogPath, reader.getTranslogChecksum()),
+                    new CheckpointFileSnapshot(
+                        readerPrimaryTerm,
+                        checkpointGeneration,
+                        minTranslogGeneration,
+                        checkpointPath,
+                        reader.getCheckpointChecksum()
+                    )
                 );
                 if (readerGeneration > highestGeneration) {
                     highestGeneration = readerGeneration;
@@ -136,9 +187,11 @@ public class TranslogCheckpointTransferSnapshot implements TransferSnapshot {
             translogTransferSnapshot.setMinTranslogGeneration(highestGenMinTranslogGeneration);
 
             assert this.primaryTerm == highestGenPrimaryTerm : "inconsistent primary term";
-            assert this.generation == highestGeneration : "inconsistent generation";
+            assert this.generation == highestGeneration : " inconsistent generation ";
+            final long finalHighestGeneration = highestGeneration;
             assert LongStream.iterate(lowestGeneration, i -> i + 1)
                 .limit(highestGeneration)
+                .filter(l -> (l <= finalHighestGeneration))
                 .boxed()
                 .collect(Collectors.toList())
                 .equals(generations.stream().sorted().collect(Collectors.toList())) == true : "generation gaps found";
